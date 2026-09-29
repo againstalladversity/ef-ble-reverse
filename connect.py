@@ -69,11 +69,76 @@ class SmartBackupMode:
     OFF = 0
     ON  = 2
 
+# Delta 2 (mr521) heartbeat struct layouts, ported from the community-maintained field
+# definitions in https://github.com/rabits/ha-ef-ble (eflib/model/*.py). These are raw
+# fixed-width binary structs (not protobuf) sent unencrypted by the device - each is a list
+# of (name, struct_format_char) pairs, decoded left to right; trailing fields are dropped if
+# the payload is shorter than the full struct (firmware may omit newer trailing fields).
+DELTA2_PD_HEART = [
+    ('model','B'),('error_code','4s'),('sys_ver','4s'),('wifi_ver','4s'),
+    ('wifi_auto_recovery','B'),('soc','B'),('watts_out_sum','H'),('watts_in_sum','H'),
+    ('remain_time','i'),('quiet_mode','B'),('dc_out_state','B'),
+    ('usb1_watt','B'),('usb2_watt','B'),('qc_usb1_watt','B'),('qc_usb2_watt','B'),
+    ('typec1_watts','B'),('typec2_watts','B'),('typec1_temp','B'),('typec2_temp','B'),
+    ('car_state','B'),('car_watts','B'),('car_temp','B'),
+    ('standby_min','H'),('lcd_off_sec','H'),('lcd_brightness','B'),
+    ('dc_chg_power','I'),('sun_chg_power','I'),('ac_chg_power','I'),('dc_dsg_power','I'),('ac_dsg_power','I'),
+    ('usb_used_time','I'),('usb_qc_used_time','I'),('type_c_used_time','I'),('car_used_time','I'),
+    ('inv_used_time','I'),('dc_in_used_time','I'),('mppt_used_time','I'),
+]
+DELTA2_EMS_HEART = [
+    ('chg_state','B'),('chg_cmd','B'),('dsg_cmd','B'),('chg_vol','I'),('chg_amp','I'),
+    ('fan_level','B'),('max_charge_soc','B'),('bms_model','B'),('lcd_show_soc','B'),('open_ups_flag','B'),
+    ('bms_warning_state','B'),('chg_remain_time','I'),('dsg_remain_time','I'),('ems_is_normal_flag','B'),
+    ('f32_lcd_show_soc','f'),('bms_is_connt','3s'),('max_available_num','B'),('open_bms_idx','B'),
+    ('para_vol_min','I'),('para_vol_max','I'),('min_dsg_soc','B'),('open_oil_eb_soc','B'),('close_oil_eb_soc','B'),
+]
+DELTA2_BMS_HEART = [
+    ('num','B'),('type','B'),('cell_id','B'),('err_code','I'),('sys_ver','I'),('soc','B'),
+    ('vol','I'),('amp','I'),('temp','B'),('open_bms_idx','B'),('design_cap','I'),('remain_cap','I'),
+    ('full_cap','I'),('cycles','I'),('soh','B'),('max_cell_vol','H'),('min_cell_vol','H'),
+    ('max_cell_temp','B'),('min_cell_temp','B'),('max_mos_temp','B'),('min_mos_temp','B'),
+    ('bms_fault','B'),('bq_sys_stat_reg','B'),('tag_chg_amp','I'),('f32_show_soc','f'),
+    ('input_watts','I'),('output_watts','I'),('remain_time','I'),
+]
+DELTA2_INV_HEART = [
+    ('err_code','I'),('sys_ver','I'),('charger_type','B'),('input_watts','H'),('output_watts','H'),
+    ('inv_type','B'),('inv_out_vol','I'),('inv_out_amp','I'),('inv_out_freq','B'),
+    ('ac_in_vol','I'),('ac_in_amp','I'),('ac_in_freq','B'),('out_temp','H'),
+    ('dc_in_vol','I'),('dc_in_amp','I'),('dc_in_temp','H'),('fan_state','B'),('cfg_ac_enabled','B'),
+    ('cfg_ac_xboost','B'),('cfg_ac_out_voltage','I'),('cfg_ac_out_freq','B'),('cfg_ac_work_mode','B'),
+    ('cfg_pause_flag','B'),('ac_dip_switch','B'),('cfg_fast_chg_watts','H'),('cfg_slow_chg_watts','H'),
+    ('standby_mins','H'),('discharge_type','B'),('ac_passby_auto_en','B'),('pr_balance_mode','B'),
+    ('ac_chg_rated_power','H'),('cfg_gfci_enable','B'),
+]
+DELTA2_MPPT_HEART = [
+    ('fault_code','I'),('sw_ver','4s'),('in_vol','I'),('in_amp','I'),('in_watts','H'),
+    ('out_val','I'),('out_amp','I'),('out_watts','H'),('mppt_temp','h'),('xt60_chg_type','B'),
+    ('cfg_chg_type','B'),('chg_type','B'),('chg_state','B'),('dcdc_12v_vol','I'),('dcdc_12v_amp','I'),
+    ('dcdc_12v_watts','H'),('car_out_vol','I'),('car_out_amp','I'),('car_out_watts','H'),
+    ('car_temp','h'),('car_state','B'),('dc24v_temp','h'),('dc24v_state','B'),('chg_pause_flag','B'),
+    ('cfg_dc_chg_current','I'),
+]
+
+def decodeRawStruct(fields, payload):
+    '''Decodes a fixed-width little-endian struct, dropping trailing fields if payload is
+    shorter than the full definition (firmware may omit newer trailing fields)'''
+    use = fields
+    fmt = '<' + ''.join(f for _, f in use)
+    size = struct.calcsize(fmt)
+    while size > len(payload) and use:
+        use = use[:-1]
+        fmt = '<' + ''.join(f for _, f in use)
+        size = struct.calcsize(fmt)
+    values = struct.unpack(fmt, payload[:size])
+    return dict(zip((n for n, _ in use), values))
+
 class Device:
     MANUFACTURER_KEY = 0xb5b5
     SUPPORTED_DEVICES = (
         b'HD31', # Smart Home Panel 2
         b'Y711', # Delta Pro Ultra
+        b'R331', # Delta 2
     )
 
     @staticmethod
@@ -193,7 +258,13 @@ class Packet:
     @staticmethod
     def fromBytes(data, is_xor = False):
         '''Deserializes bytes stream into internal data'''
-        if len(data) < 20:
+        # Version 2 packets have a 16-byte header with no dsrc/ddst fields; version 3 (and
+        # the v19 sentinel variant used by HD31) has an 18-byte header with dsrc/ddst present
+        version = data[1] if len(data) > 1 else 0
+        has_dsrc_ddst = version != 2
+        payload_start = 18 if has_dsrc_ddst else 16
+
+        if len(data) < payload_start:
             print("ERROR: Unable to parse packet - too small: " + bytearray(data).hex())
             return None
 
@@ -201,10 +272,9 @@ class Packet:
             print("ERROR: Unable to parse packet - prefix is incorrect: " + bytearray(data).hex())
             return None
 
-        version = data[1]
         payload_length = struct.unpack('<H', data[2:4])[0]
 
-        if version == 3:
+        if version in (2, 3):
             # Check whole packet CRC16
             if crc16.arc(data[:-2]) != struct.unpack('<H', data[-2:])[0]:
                 print("ERROR: Unable to parse packet - incorrect CRC16: " + bytearray(data).hex())
@@ -222,14 +292,20 @@ class Packet:
         # data[10:12] # static zeroes
         src = data[12]
         dst = data[13]
-        dsrc = data[14]
-        ddst = data[15]
-        cmd_set = data[16]
-        cmd_id = data[17]
+        if has_dsrc_ddst:
+            dsrc = data[14]
+            ddst = data[15]
+            cmd_set = data[16]
+            cmd_id = data[17]
+        else:
+            dsrc = 1
+            ddst = 1
+            cmd_set = data[14]
+            cmd_id = data[15]
 
         payload = b''
         if payload_length > 0:
-            payload = data[18:18+payload_length]
+            payload = data[payload_start:payload_start+payload_length]
 
             # If first byte of seq is set - we need to xor payload with it to get the real data
             if is_xor == True and seq[0] != b'\x00':
@@ -320,6 +396,7 @@ class Connection:
         self._disconnected = asyncio.Event()
         self._client = None
         self._enc_packet_buffer = b''
+        self._plain_packet_buffer = b''
 
     async def shutdown(self):
         self._retry_on_disconnect = False
@@ -441,6 +518,45 @@ class Connection:
 
         return packets
 
+    async def parsePlainPackets(self, data: str):
+        '''Deserializes a raw byte stream into a list of Packets, for devices (e.g. Delta 2 /
+        mr521 family) that send Packet frames directly on the wire with no EncPacket wrapper
+        and no session encryption'''
+        if self._plain_packet_buffer:
+            data = self._plain_packet_buffer + data
+            self._plain_packet_buffer = b''
+
+        print("%s: ParsePlainPackets: %r" % (self._address, bytearray(data).hex()))
+
+        packets = list()
+        while data:
+            if not data.startswith(Packet.PREFIX):
+                print("%s: ERROR: Unable to parse plain packet - prefix is incorrect: %r" % (self._address, bytearray(data).hex()))
+                return packets
+
+            if len(data) < 16:
+                self._plain_packet_buffer += data
+                break
+
+            version = data[1]
+            payload_length = struct.unpack('<H', data[2:4])[0]
+            # v2 has a 16-byte header (no dsrc/ddst), v3 has an 18-byte header; both carry
+            # a trailing 2-byte CRC16 (only the v19 HD31 sentinel format doesn't, but that's
+            # not used on this raw/unencrypted channel)
+            payload_start = 16 if version == 2 else 18
+            data_end = payload_start + payload_length + 2
+            if data_end > len(data):
+                self._plain_packet_buffer += data
+                break
+
+            packet = Packet.fromBytes(data[:data_end])
+            data = data[data_end:]
+
+            if packet != None:
+                packets.append(packet)
+
+        return packets
+
     async def printServices(self):
         print("%s: INFO: Service scan started..." % (self._address,))
         for service in self._client.services:
@@ -501,7 +617,12 @@ class Connection:
 
         print("%s: INFO: Init completed, running init routine" % (self._address,))
 
-        await self.initBleSessionKey()
+        if self._dev_sn.startswith('R331'):
+            # Delta 2 (mr521): no ECDH handshake, no session encryption - the device just
+            # pushes raw Packet frames as soon as notifications are enabled
+            await self.startPlainListening()
+        else:
+            await self.initBleSessionKey()
 
     def disconnected(self, *args, **kwargs) -> None:
         print("%s: Disconnected from device callback" % (self._address,))
@@ -516,6 +637,36 @@ class Connection:
         if response_handler:
             await self._client.start_notify(Connection.NOTIFY_CHARACTERISTIC, response_handler)
         await self._client.write_gatt_char(Connection.WRITE_CHARACTERISTIC, bytearray(send_data))
+
+    async def startPlainListening(self):
+        '''Starts listening for the unencrypted Packet stream (Delta 2 / mr521 family)'''
+        print("%s: INFO: Starting plain (unencrypted) packet listener" % (self._address,))
+        await self._client.start_notify(Connection.NOTIFY_CHARACTERISTIC, self.plainListenForDataHandler)
+
+    async def plainListenForDataHandler(self, characteristic: BleakGATTCharacteristic, recv_data: bytearray):
+        packets = await self.parsePlainPackets(bytes(recv_data))
+
+        for packet in packets:
+            # Dispatch table matches https://github.com/rabits/ha-ef-ble's Delta2Base.data_parse
+            decoded = None
+            if packet.src == 0x02 and packet.cmdSet == 0x20 and packet.cmdId == 0x02:
+                decoded = ('PdHeart', decodeRawStruct(DELTA2_PD_HEART, packet.payload))
+            elif packet.src == 0x03 and packet.cmdSet == 0x20 and packet.cmdId == 0x02:
+                decoded = ('EmsHeart', decodeRawStruct(DELTA2_EMS_HEART, packet.payload))
+            elif packet.src == 0x03 and packet.cmdSet == 0x20 and packet.cmdId == 0x32:
+                decoded = ('BmsHeart[main]', decodeRawStruct(DELTA2_BMS_HEART, packet.payload))
+            elif packet.src == 0x06 and packet.cmdSet == 0x20 and packet.cmdId == 0x32:
+                decoded = ('BmsHeart[extra1]', decodeRawStruct(DELTA2_BMS_HEART, packet.payload))
+            elif packet.src == 0x04 and packet.cmdId == 0x02:
+                decoded = ('InvHeart', decodeRawStruct(DELTA2_INV_HEART, packet.payload))
+            elif packet.src == 0x05 and packet.cmdSet == 0x20 and packet.cmdId == 0x02:
+                decoded = ('MpptHeart', decodeRawStruct(DELTA2_MPPT_HEART, packet.payload))
+
+            if decoded:
+                name, fields = decoded
+                print("%s: %s: %s" % (self._address, name, fields))
+            else:
+                print("%s: Plain packet (unmapped): %r" % (self._address, packet))
 
     async def sendPacket(self, packet: Packet, response_handler = None):
         print("%s: Sending packet: %r" % (self._address, packet))
